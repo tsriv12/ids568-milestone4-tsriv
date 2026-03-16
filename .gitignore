@@ -1,0 +1,8 @@
+data/
+output_local/
+output_distributed/
+queue_buffer/
+streaming_results/
+__pycache__/
+*.pyc
+milestone4-env/
