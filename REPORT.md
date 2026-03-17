@@ -71,7 +71,7 @@ PySpark's `local` master. "Single-threaded" = `local[1]` (1 Spark task slot);
 ### Shuffle Volume (Measured — Multi-Threaded Mode)
 
 Shuffle metrics were captured from the Spark REST API
-(`localhost:4040/api/v1/applications/<id>/stages`) during the distributed run.
+(`localhost:4040/api/v1/applications/<id>/stages`) during the multi-threaded `local[*]` run.
 The single-threaded run's Spark UI timed out before the REST query completed;
 `local[1]` with a single task slot performs no cross-partition shuffle exchange.
 
