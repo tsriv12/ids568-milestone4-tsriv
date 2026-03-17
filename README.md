@@ -2,7 +2,7 @@
 
 **NetID:** tsriv  
 **Course:** MLOps — Module 5  
-**Framework:** PySpark 3.5.1 + Kafka (streaming bonus)
+**Framework:** PySpark 3.5.1 (distributed) + Python file-based queue (streaming)
 
 ---
 
@@ -11,8 +11,8 @@
 ids568-milestone4-tsriv/
 ├── pipeline.py            # Distributed feature engineering (PySpark)
 ├── generate_data.py       # Synthetic dataset generation (10M+ rows)
-├── producer.py            # Kafka streaming event producer
-├── consumer.py            # Kafka streaming consumer with windowing
+├── producer.py            # Streaming event producer (file-based queue)
+├── consumer.py            # Streaming consumer with tumbling windows
 ├── README.md              # This file
 ├── REPORT.md              # Performance analysis & architecture report
 ├── STREAMING_REPORT.md    # Streaming analysis & metrics
@@ -30,7 +30,6 @@ ids568-milestone4-tsriv/
 | PySpark | 3.5.1 |
 | pyarrow | 23.0.1 |
 | kafka-python | 2.0.2+ |
-| Kafka broker | 3.7.0 |
 
 ---
 
@@ -78,7 +77,7 @@ python generate_data.py --rows 10000000 --seed 42 --partitions 20 --output data/
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--rows` | 10000000 | Number of rows to generate |
-| `--seed` | 42 | Random seed (use 42 for reproducibility) |
+| `--seed` | 42 | Random seed (use 42 to reproduce published results) |
 | `--output` | data/ | Output directory |
 | `--partitions` | 10 | Number of Parquet output files |
 
@@ -108,18 +107,16 @@ python pipeline.py \
 | `--output` | output/ | Output directory |
 | `--mode` | distributed | `local` or `distributed` |
 | `--partitions` | 8 | Spark shuffle partitions |
-| `--workers` | 4 | Threads for local mode |
+| `--workers` | 4 | Threads for local mode only |
 
 ### Step 3 — View results
 ```bash
-# View performance metrics
 cat output_local/metrics.json
 cat output_distributed/metrics.json
 ```
 
 ### Reproducibility Verification
 ```bash
-# Verify identical output across runs with same seed
 python generate_data.py --rows 100 --seed 42 --output run1/
 python generate_data.py --rows 100 --seed 42 --output run2/
 diff -r run1/ run2/ && echo "REPRODUCIBLE" || echo "NOT REPRODUCIBLE"
@@ -130,44 +127,81 @@ rm -rf run1/ run2/
 
 ## Part 2: Streaming Pipeline (Bonus)
 
-### Prerequisites — Start Kafka
-```bash
-# Start Zookeeper (terminal 1)
-~/kafka/bin/zookeeper-server-start.sh ~/kafka/config/zookeeper.properties &
-sleep 5
+### Architecture
 
-# Start Kafka broker (terminal 2)
-~/kafka/bin/kafka-server-start.sh ~/kafka/config/server.properties &
-sleep 5
-
-# Create topic
-~/kafka/bin/kafka-topics.sh --create \
-    --topic user-events \
-    --bootstrap-server localhost:9092 \
-    --partitions 4 \
-    --replication-factor 1
+The streaming pipeline uses a **file-based mock queue** (per the assignment's
+allowed alternatives to Kafka). The producer writes JSON event files to a
+shared directory; the consumer polls that directory, processes events through
+tumbling windows, and deletes files after consumption — mirroring Kafka
+producer/consumer semantics without requiring a broker.
+```
+producer.py  →  queue_buffer/  →  consumer.py  →  streaming_results/
+(event gen)     (shared dir)      (windowing)       (JSON outputs)
 ```
 
-### Run the streaming pipeline
+### Run producer and consumer together
+
+Open two terminals (or use `&` for background):
 ```bash
 # Terminal 1 — Start consumer first
-python consumer.py --topic user-events --window 30
+python consumer.py \
+    --queue-dir queue_buffer/ \
+    --window 30 \
+    --duration 90 \
+    --output streaming_results/
 
 # Terminal 2 — Start producer
-python producer.py --topic user-events --rate 100 --duration 120
+python producer.py \
+    --queue-dir queue_buffer/ \
+    --rate 100 \
+    --duration 60
 ```
+
+**Producer arguments:**
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--queue-dir` | queue_buffer/ | Shared queue directory |
+| `--rate` | 100 | Target events per second |
+| `--duration` | 120 | Run duration in seconds |
+| `--seed` | 42 | Random seed |
+| `--load-test` | flag | Run automated load test (100/1000/5000 msg/s) |
+
+**Consumer arguments:**
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--queue-dir` | queue_buffer/ | Shared queue directory (must match producer) |
+| `--window` | 30 | Tumbling window size in seconds |
+| `--max-lag` | 10 | Max seconds late events are still accepted |
+| `--duration` | 180 | Consumer runtime in seconds |
+| `--output` | streaming_results/ | Output directory for window results |
+| `--load-test` | flag | Process all load test subdirs and report metrics |
 
 ### Run load test
 ```bash
-# Automated load test across all rates
-python producer.py --load-test --topic user-events
+# Step 1 — Run producer load test (generates data at 100, 1000, 5000 msg/s)
+python producer.py --queue-dir queue_buffer/ --load-test
+
+# Step 2 — Run consumer load test (processes and reports p50/p95/p99)
+python consumer.py --queue-dir queue_buffer/ --load-test --output streaming_results/
+
+# View results
+cat streaming_results/load_test_consumer_results.json
+```
+
+### View window results
+```bash
+# Individual window outputs
+ls streaming_results/window_*.json
+
+# Overall summary
+cat streaming_results/summary.json
 ```
 
 ---
 
 ## Automated Sanity Checks
-
-Run the full checklist verification:
 ```bash
 # File existence
 for file in pipeline.py generate_data.py README.md REPORT.md; do
@@ -199,12 +233,20 @@ rm -rf test_data/ test_output/
 | Input rows | 10,000,000 | 10,000,000 |
 | Output cols | 30 | 30 |
 
-See `REPORT.md` for full analysis.
+**Streaming (real-time, 100 msg/s):**
+
+| Metric | Value |
+|--------|-------|
+| p50 latency | 25.53 ms |
+| p95 latency | 48.26 ms |
+| p99 latency | 50.21 ms |
+| Breaking point | ~2,500 msg/s (disk saturation) |
+
+See `REPORT.md` and `STREAMING_REPORT.md` for full analysis.
 
 ---
 
 ## Seeds & Determinism
 
 All randomness is seeded. Use `--seed 42` (default) to reproduce
-published results exactly. Different seeds produce different data
-but identical schema and statistical properties.
+published results exactly.
