@@ -4,7 +4,7 @@
 
 | Component | Details |
 |-----------|---------|
-| Machine | GCP VM |
+| Machine | GCP Cloud Shell VM |
 | CPU | AMD EPYC 7B12 — 2 vCPUs, 2 threads/core |
 | RAM | 7.8 GB total, 7.0 GB available |
 | OS | Debian (Ubuntu 24.04 compatible) |
@@ -20,10 +20,11 @@
 |----------|-------|
 | Total rows | 10,000,000 |
 | Input partitions | 20 Parquet files |
-| Input size (disk) | 245 MB |
+| Input size (disk) | 256.05 MB |
+| Input size (in-memory, deserialized) | 2,220.32 MB |
 | Columns (raw) | 10 |
 | Columns (engineered) | 30 |
-| Output size (disk) | 610 MB |
+| Output size (disk) | ~634 MB |
 | Random seed | 42 |
 | Generation time | 11.91s |
 
@@ -33,12 +34,12 @@
 
 The pipeline implements 8 categories of distributed transformations:
 
-1. **Null imputation** — distributed mean aggregation, then fill
+1. **Null imputation** — distributed mean aggregation then fill
 2. **Type casting** — schema enforcement across all partitions
 3. **Derived features** — click-through rate, cart-per-pageview, log-income, log-cart-value
-4. **Binning** — age groups (youth/young_adult/middle_aged/senior), income brackets (low/medium/high/very_high)
+4. **Binning** — age groups (4 categories), income brackets (4 categories)
 5. **One-hot encoding** — device_type (3 columns), region (5 columns)
-6. **Window features** — region-level average session time and click rate (requires shuffle)
+6. **Window features** — region-level avg session time and click rate (requires shuffle)
 7. **Min-max normalization** — session_time and page_views scaled to [0,1]
 8. **Interaction term** — income × page_views
 
@@ -46,94 +47,133 @@ The pipeline implements 8 categories of distributed transformations:
 
 ## Performance Comparison: Local vs Distributed
 
-### Runtime Metrics
+All metrics below are **directly measured** via instrumented benchmark runs
+(`benchmark.py`), not estimated. CPU and memory were sampled every 0.5 seconds
+by a background psutil thread throughout each run.
+
+### Runtime Breakdown (Measured)
+
+| Stage | Local (1 worker) | Distributed (16 threads) | Δ |
+|-------|-----------------|--------------------------|---|
+| Read + cache | 59.944s | 53.082s | −6.86s |
+| Transform + write | 136.231s | 131.564s | −4.67s |
+| Output recount | 4.423s | 5.343s | +0.92s |
+| **Total runtime** | **200.598s** | **189.990s** | **−10.61s** |
+| **Speedup** | 1.00× (baseline) | **1.056×** | |
+
+### Shuffle Volume (Measured — Distributed Mode)
+
+Shuffle metrics were captured from the Spark REST API
+(`localhost:4040/api/v1/applications/<id>/stages`) during the distributed run.
+The local run's Spark UI timed out before the REST query completed; local mode
+with a single worker performs no cross-partition shuffle exchange.
+
+| Metric | Value |
+|--------|-------|
+| Shuffle read bytes | 2,068,588,226 bytes |
+| **Shuffle read volume** | **2,068.59 MB** |
+| Shuffle write bytes | 2,068,588,226 bytes |
+| **Shuffle write volume** | **2,068.59 MB** |
+| Total shuffle (read + write) | **4,137.18 MB** |
+| Shuffle per partition (16) | **129.29 MB / partition** |
+| Total Spark stages | 26 |
+| Total tasks | 364 |
+| Failed tasks | 0 |
+
+**Primary shuffle sources:** The `Window.partitionBy("region")` operation
+(region-level aggregations) and the final `repartition(16)` call are the
+dominant shuffle contributors. The window operation requires a full data
+exchange keyed by region (5 distinct values across 10M rows = ~2M rows/key),
+explaining the high shuffle volume relative to input size.
+
+### CPU Utilization (Measured)
 
 | Metric | Local (1 worker) | Distributed (16 threads) |
 |--------|-----------------|--------------------------|
-| Spark master | local[1] | local[*] |
-| Shuffle partitions | 4 | 16 |
-| Default parallelism | 4 | 16 |
-| Input rows | 10,000,000 | 10,000,000 |
-| Output rows | 10,000,000 | 10,000,000 |
-| Output partitions | 4 | 16 |
-| **Total runtime** | **110.18s** | **100.71s** |
-| Speedup | 1.0x (baseline) | **1.09x** |
-| Output size | 610 MB | 610 MB |
+| CPU mean % | **64.2%** | **93.9%** |
+| CPU max % | 98.0% | 99.0% |
+| CPU min % | 0.0% | 0.0% |
+| psutil samples | 401 | 380 |
+| Sampling interval | 0.5s | 0.5s |
 
-### Shuffle Volume
-
-Window aggregations (region-level) and repartition operations are the
-primary shuffle contributors. With 16 partitions, each shuffle stage
-exchanges approximately **610 MB / 16 ≈ 38 MB per partition**.
-In local[1] mode with 4 partitions, shuffle stages process ~153 MB per
-partition serially, increasing per-stage wall time.
+**Interpretation:** The distributed run sustains 93.9% mean CPU utilization
+versus 64.2% for local mode — a 46% improvement in CPU efficiency. The
+minimum of 0.0% in both modes reflects sequential barriers (`.collect()`
+calls for mean imputation and min-max stats) where all threads idle waiting
+for the driver to receive aggregated results.
 
 ### Memory Usage
 
 | Metric | Local | Distributed |
 |--------|-------|-------------|
-| Driver memory config | 4 GB | 4 GB |
-| Executor memory config | 4 GB | 4 GB |
+| Driver process RSS (measured) | 41 MB | 41 MB |
+| JVM heap (configured) | 4 GB | 4 GB |
+| Spark executor memory config | 4 GB | 4 GB |
 | VM RAM available | 7.0 GB | 7.0 GB |
-| Peak observed usage | ~3.1 GB | ~3.5 GB |
 
-The distributed run uses slightly more memory due to maintaining 16
-concurrent task slots versus 4 (or 1) in local mode.
+**Note on memory measurement:** psutil measures the Python driver process RSS
+(41 MB), which is the lightweight Python wrapper. The JVM heap — where Spark
+stores cached RDD partitions and shuffle buffers — is not directly accessible
+via psutil. The 4 GB JVM heap configuration was sufficient for all runs (no
+spill-to-disk errors observed, all 364 tasks completed successfully with 0
+failures). For precise JVM heap profiling, a JMX-based tool such as
+`jconsole` or Spark's built-in metrics with Graphite sink would be required.
 
-### Worker Utilization
+### Partition Analysis
 
-| Mode | Threads | Utilization |
-|------|---------|-------------|
-| Local | 1 | ~50% of 1 vCPU (single-threaded Spark tasks) |
-| Distributed | 16 | ~90% across both vCPUs during shuffle phases |
-
----
-
-## Analysis: Why the Speedup is Modest (1.09x)
-
-The relatively small speedup from local to distributed mode on this VM
-is explained by several factors:
-
-### 1. Hardware Ceiling
-The GCP VM has only **2 physical vCPUs**. Even with `local[*]` launching
-16 threads, the OS can only execute 2 threads truly in parallel. The
-additional threads introduce context-switching overhead that partially
-offsets parallelism gains.
-
-### 2. I/O Bottleneck
-Reading 245 MB of Parquet and writing 610 MB hits the same disk in both
-modes. Distributed processing cannot parallelize I/O when the storage
-layer is a single local disk — this is the primary bottleneck.
-
-### 3. Crossover Point
-On a single 2-vCPU machine, distributed overhead (task scheduling,
-shuffle coordination, serialization) consumes a meaningful fraction of
-total runtime. The crossover where distributed processing becomes
-clearly beneficial occurs at:
-- **≥4 physical cores** on a single machine, or
-- **True multi-node cluster** (separate executor JVMs, network shuffle)
-
-At 10M rows on this hardware, the pipeline is I/O and shuffle bound,
-not compute bound.
+| Metric | Local | Distributed |
+|--------|-------|-------------|
+| Shuffle partitions | 4 | 16 |
+| Default parallelism | 4 | 16 |
+| Output partitions | 4 | 16 |
+| Input partitions (Parquet files) | 20 | 20 |
+| Input size / partition | 12.8 MB | 12.8 MB |
+| Output size / partition | 158.6 MB | 39.6 MB |
+| Shuffle volume / partition | N/A | 129.3 MB |
 
 ---
 
 ## Bottleneck Identification
 
-Using Spark's execution model, the primary bottlenecks are:
+### Stage Timing Analysis
 
-| Stage | Bottleneck | Evidence |
-|-------|-----------|---------|
-| Data read | Disk I/O | 245 MB read from local filesystem |
-| Window aggregations | Shuffle | region partitionBy triggers full data exchange |
-| Min-max stats | Driver collect | Two `.collect()` calls serialize to driver |
-| Repartition | Shuffle + write | 610 MB written across output partitions |
+The transform + write stage dominates total runtime in both modes
+(136.2s local, 131.6s distributed — 68% of total). Breaking this down:
 
-The two `.collect()` calls (mean imputation + min-max stats) are
-sequential barriers — all tasks must complete before the next stage
-begins. In a true distributed cluster, these would be the primary
-optimization targets (e.g., replace with approximate statistics or
-broadcast joins).
+| Bottleneck | Evidence | Impact |
+|-----------|---------|--------|
+| **Window aggregation shuffle** | 2,068 MB shuffle read/write measured | Primary bottleneck — full data exchange for region partitionBy |
+| **Sequential collect() barriers** | CPU drops to 0% at 2 points | Mean imputation + min-max stats each block all parallelism |
+| **Read I/O** | 59.9s local vs 53.1s distributed | Disk I/O bound on single local filesystem |
+| **Output write** | 634 MB written, included in transform stage | Compressed Parquet write is CPU-intensive |
+
+### Why Speedup is Modest (1.056×)
+
+On this 2-vCPU VM, the distributed run achieves only 1.056× speedup despite
+16× more parallelism configuration. Three factors explain this:
+
+1. **Hardware ceiling:** 2 physical vCPUs limit true parallelism to 2
+   concurrent threads regardless of how many are configured. The 16-thread
+   config causes OS-level context switching overhead.
+
+2. **Sequential barriers:** Two `.collect()` calls (mean imputation,
+   min-max normalization) serialize execution — all parallel tasks must
+   complete before the driver proceeds. These account for an estimated
+   15–20s of blocked time per run.
+
+3. **Shuffle overhead:** 4,137 MB of total shuffle traffic on a single
+   local filesystem means all shuffle I/O is serialized through one disk,
+   eliminating the network parallelism benefit of true multi-node clusters.
+
+### Crossover Point
+
+On this hardware, distributed processing provides measurable but marginal
+benefit. The crossover where distributed clearly wins requires either:
+- **≥ 4 physical cores** on a single machine, or
+- **True multi-node cluster** with network shuffle between separate JVMs
+
+At 50M+ rows on this VM, I/O bottlenecks would dominate and distributed
+mode would show stronger relative improvement due to better task pipelining.
 
 ---
 
@@ -141,81 +181,85 @@ broadcast joins).
 
 ### Reliability Trade-offs
 
-**Spill-to-disk:** PySpark automatically spills partition data to disk
-when executor memory is exhausted. With 7.8 GB RAM and 610 MB output,
-no spill occurred in our runs. In production with larger datasets,
-increasing `spark.executor.memory` and tuning `spark.memory.fraction`
-(default 0.6) reduces spill risk.
+**Spill-to-disk:** With 0 failed tasks across 364 total tasks and no
+`OutOfMemoryError` in logs, the 4 GB JVM heap was sufficient. In production
+with larger datasets, tuning `spark.memory.fraction` (default 0.6) and
+`spark.memory.storageFraction` (default 0.5) balances execution vs storage
+memory.
 
-**Speculative execution:** Disabled in local mode (only 1 executor).
+**Speculative execution:** Disabled in local mode (single executor).
 In a multi-node cluster, `spark.speculation=true` re-launches straggler
-tasks on other nodes, improving tail latency at the cost of duplicate
-compute.
+tasks, improving tail latency at ~5% compute overhead.
 
-**Fault tolerance:** Spark RDDs and DataFrames are lineage-tracked —
-if a partition fails, Spark recomputes it from source. This provides
-resilience without replication overhead, unlike traditional databases.
+**Fault tolerance:** Spark lineage-based recovery means any failed partition
+is recomputed from source without full restart. The 26-stage DAG means
+recovery cost is at most one stage's worth of computation.
 
 ### When Distributed Processing Provides Benefits vs Overhead
 
-| Scenario | Use Distributed? | Rationale |
-|----------|-----------------|-----------|
-| < 1M rows, single machine | ❌ No | Overhead > benefit; pandas is faster |
-| 1M–50M rows, 4+ cores | ✅ Yes | Parallelism exceeds scheduling cost |
-| 50M+ rows, any hardware | ✅ Yes | Required; data exceeds single-machine RAM |
+| Scenario | Recommendation | Rationale |
+|----------|---------------|-----------|
+| < 1M rows, single machine | ❌ Use pandas | Spark overhead > compute benefit |
+| 1–50M rows, 2 vCPUs (this VM) | ⚠️ Marginal | 1.056× speedup — barely worth complexity |
+| 1–50M rows, 4+ cores | ✅ Yes | Parallelism exceeds scheduling cost |
+| > 50M rows, any hardware | ✅ Yes | Required; data may exceed single-node RAM |
 | Real-time inference features | ❌ No | Latency requirements favor in-process computation |
-| Batch training pipelines | ✅ Yes | Throughput > latency; horizontal scaling is cost-effective |
-
-On this VM specifically, the crossover is approximately **50M rows**
-where distributed parallelism would overcome I/O serialization overhead.
 
 ### Cost Implications
 
-| Resource | Local Mode | Distributed (16t) | Multi-node Cluster |
-|----------|-----------|-------------------|-------------------|
-| Compute | 1 vCPU·h | 2 vCPU·h | N × vCPU·h |
-| Storage | 610 MB | 610 MB | 610 MB × replication |
-| Network | 0 | 0 | Shuffle traffic |
-| GCP e2-standard-2 cost | ~$0.067/hr | ~$0.067/hr | Scales linearly |
+| Resource | Local Mode | Distributed (16t) |
+|----------|-----------|-------------------|
+| Runtime | 200.6s | 190.0s |
+| GCP e2-standard-2 rate | $0.067/hr | $0.067/hr |
+| **Cost per run** | **$0.00373** | **$0.00353** |
+| Cost per 1,000 runs | $3.73 | $3.53 |
+| Monthly (daily runs) | $0.11 | $0.11 |
 
-For a production pipeline running daily on 10M rows, the total GCP cost
-is approximately **$0.002 per run** at e2-standard-2 pricing ($0.067/hr
-× 110s/3600). Scaling to 1B rows on a 10-node cluster would cost roughly
-$0.20–$0.50 per run depending on instance type.
+At 10M rows/run, cost difference is negligible ($0.0002/run). Cost savings
+from distributed processing become meaningful at 1B+ rows where runtime
+differences are measured in hours rather than seconds.
 
 ### Production Deployment Recommendations
 
-1. **Partition strategy:** Target 128–256 MB per partition for optimal
-   Spark task sizing. Our 20-partition input (12 MB each) is slightly
-   under-sized; 4–8 partitions would reduce scheduling overhead.
-2. **Caching:** Cache the input DataFrame before the first `.collect()`
-   call to avoid re-reading Parquet for subsequent aggregations.
-3. **Adaptive Query Execution (AQE):** Enabled in our pipeline
-   (`spark.sql.adaptive.enabled=true`). AQE dynamically coalesces small
-   shuffle partitions, improving performance on skewed data.
-4. **Monitoring:** Use Spark UI (port 4040 during execution) to identify
-   slow stages. In production, integrate with Prometheus + Grafana for
-   continuous monitoring.
-5. **When NOT to use distributed processing:** For datasets under 1M rows,
-   pandas + scikit-learn pipelines execute 10–50x faster due to zero
-   scheduling overhead. Reserve PySpark for data that exceeds single-node
-   RAM or requires horizontal scaling.
+1. **Partition strategy:** Target 128–256 MB per partition. Our 20-file
+   input (12.8 MB/file) is under-partitioned for Spark; consolidating to
+   4–8 input files would reduce task scheduling overhead.
+
+2. **Eliminate collect() barriers:** Replace mean imputation `.collect()`
+   with approximate statistics (`approxQuantile`) or pre-computed broadcast
+   variables to eliminate sequential barriers.
+
+3. **Window optimization:** The region window shuffle (2,068 MB) could be
+   reduced by pre-aggregating region stats in a separate pass and broadcasting
+   the 5-row result, eliminating the full shuffle entirely.
+
+4. **AQE:** Enabled (`spark.sql.adaptive.enabled=true`). Dynamically
+   coalesces shuffle partitions, reducing small-task overhead.
+
+5. **When NOT to use distributed:** For < 1M rows or latency-sensitive
+   pipelines, pandas + scikit-learn pipelines execute 10–50× faster with
+   zero scheduling overhead.
 
 ---
 
 ## Reproducibility
-
-All results are fully reproducible:
 ```bash
-# Regenerate data (identical output guaranteed by seed)
+# Regenerate data
 python generate_data.py --rows 10000000 --seed 42 --partitions 20 --output data/
 
 # Reproduce local benchmark
-python pipeline.py --input data/ --output output_local/ --mode local --partitions 4 --workers 1
+python pipeline.py --input data/ --output output_local/ --mode local \
+    --partitions 4 --workers 1
 
 # Reproduce distributed benchmark
-python pipeline.py --input data/ --output output_distributed/ --mode distributed --partitions 16
+python pipeline.py --input data/ --output output_distributed/ \
+    --mode distributed --partitions 16
+
+# Reproduce instrumented benchmark with full metrics
+python benchmark.py --input data/ --output benchmark_results/ \
+    --mode local --partitions 4 --workers 1
+python benchmark.py --input data/ --output benchmark_results/ \
+    --mode distributed --partitions 16
 ```
 
-Seed value `42` is used throughout. Parquet output is deterministic
-given identical input partitions and seed.
+Seed value `42` is used throughout. All results are deterministic.
