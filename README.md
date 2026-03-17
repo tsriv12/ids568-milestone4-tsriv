@@ -29,7 +29,11 @@ ids568-milestone4-tsriv/
 | Java | OpenJDK 11+ |
 | PySpark | 3.5.1 |
 | pyarrow | 23.0.1 |
-| kafka-python | 2.0.2+ |
+| pandas | 3.0.1 |
+| numpy | 2.4.3 |
+| kafka-python | 2.3.0 |
+| Faker | 40.11.0 |
+| psutil | 7.2.2 |
 
 ---
 
