@@ -133,6 +133,24 @@ failures). For precise JVM heap profiling, a JMX-based tool such as
 
 ---
 
+
+## Performance Visualizations
+
+### Figure 1 — Total Runtime Comparison
+![Runtime Comparison](charts/runtime_comparison.png)
+
+### Figure 2 — Stage-Level Runtime Breakdown
+![Stage Breakdown](charts/stage_breakdown.png)
+
+### Figure 3 — CPU Utilization: Local vs Distributed
+![CPU Utilization](charts/cpu_utilization.png)
+
+### Figure 4 — Shuffle Volume by Pipeline Stage
+![Shuffle Volume](charts/shuffle_volume.png)
+
+### Figure 5 — Partition Count vs Runtime
+![Partition Analysis](charts/partition_analysis.png)
+
 ## Bottleneck Identification
 
 ### Stage Timing Analysis

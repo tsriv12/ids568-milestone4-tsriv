@@ -114,6 +114,18 @@ as *consumer lag* (offset behind) vs *processing latency*.
 
 ---
 
+
+## Performance Visualizations
+
+### Figure 6 — End-to-End Latency by Load Scenario
+![Streaming Latency](charts/streaming_latency.png)
+
+### Figure 7 — Streaming Throughput: Target vs Actual
+![Streaming Throughput](charts/streaming_throughput.png)
+
+### Figure 8 — Queue Depth by Load Level (Backpressure)
+![Queue Depth](charts/queue_depth.png)
+
 ## Backpressure Analysis
 
 | Scenario | Queue Depth | Interpretation |
