@@ -45,28 +45,35 @@ The pipeline implements 8 categories of distributed transformations:
 
 ---
 
-## Performance Comparison: Local vs Distributed
+## Performance Comparison: Single-Threaded vs Multi-Threaded (Intra-Node Parallelism)
 
 All metrics below are **directly measured** via instrumented benchmark runs
 (`benchmark.py`), not estimated. CPU and memory were sampled every 0.5 seconds
 by a background psutil thread throughout each run.
 
+> **Execution model note:** Per the assignment specification ("local execution preferred;
+avoid cloud-specific features"), both runs execute on a single GCP VM using
+PySpark's `local` master. "Single-threaded" = `local[1]` (1 Spark task slot);
+"Multi-threaded" = `local[*]` (all available threads, 16 task slots on 2 vCPUs).
+> This benchmarks **intra-node parallelism**, not a true multi-node distributed cluster.
+> See the Architecture Analysis section for discussion of true distributed deployment.
+
 ### Runtime Breakdown (Measured)
 
-| Stage | Local (1 worker) | Distributed (16 threads) | Δ |
+| Stage | Single-threaded `local[1]` | Multi-threaded `local[*]` (16 slots) | Δ |
 |-------|-----------------|--------------------------|---|
 | Read + cache | 59.944s | 53.082s | −6.86s |
 | Transform + write | 136.231s | 131.564s | −4.67s |
 | Output recount | 4.423s | 5.343s | +0.92s |
 | **Total runtime** | **200.598s** | **189.990s** | **−10.61s** |
-| **Speedup** | 1.00× (baseline) | **1.056×** | |
+| **Speedup** | 1.00× (baseline) | **1.056× (intra-node)** | |
 
-### Shuffle Volume (Measured — Distributed Mode)
+### Shuffle Volume (Measured — Multi-Threaded Mode)
 
 Shuffle metrics were captured from the Spark REST API
 (`localhost:4040/api/v1/applications/<id>/stages`) during the distributed run.
-The local run's Spark UI timed out before the REST query completed; local mode
-with a single worker performs no cross-partition shuffle exchange.
+The single-threaded run's Spark UI timed out before the REST query completed;
+`local[1]` with a single task slot performs no cross-partition shuffle exchange.
 
 | Metric | Value |
 |--------|-------|
@@ -88,7 +95,7 @@ explaining the high shuffle volume relative to input size.
 
 ### CPU Utilization (Measured)
 
-| Metric | Local (1 worker) | Distributed (16 threads) |
+| Metric | Single-threaded `local[1]` | Multi-threaded `local[*]` |
 |--------|-----------------|--------------------------|
 | CPU mean % | **64.2%** | **93.9%** |
 | CPU max % | 98.0% | 99.0% |
@@ -96,10 +103,10 @@ explaining the high shuffle volume relative to input size.
 | psutil samples | 401 | 380 |
 | Sampling interval | 0.5s | 0.5s |
 
-**Interpretation:** The distributed run sustains 93.9% mean CPU utilization
-versus 64.2% for local mode — a 46% improvement in CPU efficiency. The
-minimum of 0.0% in both modes reflects sequential barriers (`.collect()`
-calls for mean imputation and min-max stats) where all threads idle waiting
+**Interpretation:** The multi-threaded `local[*]` run sustains 93.9% mean CPU
+utilization versus 64.2% for `local[1]` — a 46% improvement in CPU efficiency
+through intra-node parallelism. The minimum of 0.0% in both modes reflects
+sequential barriers (`.collect()` calls) where all task slots idle waiting
 for the driver to receive aggregated results.
 
 ### Memory Usage
@@ -165,10 +172,10 @@ The transform + write stage dominates total runtime in both modes
 | **Read I/O** | 59.9s local vs 53.1s distributed | Disk I/O bound on single local filesystem |
 | **Output write** | 634 MB written, included in transform stage | Compressed Parquet write is CPU-intensive |
 
-### Why Speedup is Modest (1.056×)
+### Why Intra-Node Speedup is Modest (1.056×)
 
-On this 2-vCPU VM, the distributed run achieves only 1.056× speedup despite
-16× more parallelism configuration. Three factors explain this:
+On this 2-vCPU VM, the multi-threaded `local[*]` run achieves only 1.056×
+speedup despite 16× more task slot configuration. Three factors explain this:
 
 1. **Hardware ceiling:** 2 physical vCPUs limit true parallelism to 2
    concurrent threads regardless of how many are configured. The 16-thread
@@ -185,10 +192,11 @@ On this 2-vCPU VM, the distributed run achieves only 1.056× speedup despite
 
 ### Crossover Point
 
-On this hardware, distributed processing provides measurable but marginal
-benefit. The crossover where distributed clearly wins requires either:
-- **≥ 4 physical cores** on a single machine, or
+On this hardware, intra-node parallelism provides measurable but marginal
+benefit. The crossover where parallelism clearly wins requires either:
+- **≥ 4 physical cores** on a single machine (vs 2 vCPUs here), or
 - **True multi-node cluster** with network shuffle between separate JVMs
+  (not tested — outside assignment scope per "local execution preferred" spec)
 
 At 50M+ rows on this VM, I/O bottlenecks would dominate and distributed
 mode would show stronger relative improvement due to better task pipelining.
@@ -218,7 +226,7 @@ recovery cost is at most one stage's worth of computation.
 | Scenario | Recommendation | Rationale |
 |----------|---------------|-----------|
 | < 1M rows, single machine | ❌ Use pandas | Spark overhead > compute benefit |
-| 1–50M rows, 2 vCPUs (this VM) | ⚠️ Marginal | 1.056× speedup — barely worth complexity |
+| 1–50M rows, 2 vCPUs (this VM) | ⚠️ Marginal | 1.056× intra-node speedup — `local[*]` vs `local[1]` |
 | 1–50M rows, 4+ cores | ✅ Yes | Parallelism exceeds scheduling cost |
 | > 50M rows, any hardware | ✅ Yes | Required; data may exceed single-node RAM |
 | Real-time inference features | ❌ No | Latency requirements favor in-process computation |
@@ -269,7 +277,7 @@ python generate_data.py --rows 10000000 --seed 42 --partitions 20 --output data/
 python pipeline.py --input data/ --output output_local/ --mode local \
     --partitions 4 --workers 1
 
-# Reproduce distributed benchmark
+# Reproduce multi-threaded benchmark (local[*] — all available cores)
 python pipeline.py --input data/ --output output_distributed/ \
     --mode distributed --partitions 16
 
@@ -277,7 +285,7 @@ python pipeline.py --input data/ --output output_distributed/ \
 python benchmark.py --input data/ --output benchmark_results/ \
     --mode local --partitions 4 --workers 1
 python benchmark.py --input data/ --output benchmark_results/ \
-    --mode distributed --partitions 16
+    --mode distributed --partitions 16  # runs as local[*]
 ```
 
 Seed value `42` is used throughout. All results are deterministic.
